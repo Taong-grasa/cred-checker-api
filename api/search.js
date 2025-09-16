@@ -1,8 +1,7 @@
-// api/search.js  (Vercel Serverless Function)
+// api/search.js — with free fallbacks (Crossref + OpenAlex + Wikipedia refs)
 
-// --- Quick CORS so Hostinger can call this API ---
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",             // you can lock this to your domain later
+  "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
   "Content-Type": "application/json; charset=utf-8",
@@ -24,42 +23,35 @@ export default async function handler(req, res) {
       return;
     }
 
-    // 1) Search with Google CSE (free: 100/day)
-    const candidates = await cseSearch(query);
+    // ---- TIER A: Google CSE ----
+    let source_tier = "CSE";
+    let candidates = [];
+    try {
+      candidates = await cseSearch(query);
+    } catch (e) {
+      // If CSE quota or API error, we’ll fallback
+      source_tier = "FALLBACK";
+    }
 
-    // 2) Fetch & score (cap work to keep free/fast)
-    const top = candidates.slice(0, 20);
-    const analyzed = [];
-    for (const c of top) {
-      const meta = await getPageMeta(c.url);
-      const parts = [
-        scorePurpose(meta, c.url),
-        scoreAuthority(meta, c.url),
-        scoreAudience(meta, c.url),
-        scoreObjectivity(meta, c.url),
-        scoreAccuracy(meta, c.url),
-        scoreCurrency(meta, c.url)
-      ];
-      const total = parts.reduce((s, p) => s + p.score, 0);
-      const verdict = total >= 25 ? "CREDIBLE" : total >= 20 ? "LIMITED" : "NOT_CREDIBLE";
-      if (verdict === "CREDIBLE") {
-        analyzed.push({
-          title: meta.title || c.title || c.url,
-          url: c.url,
-          publisher: meta.publisher || hostOf(c.url),
-          published: meta.published || null,
-          score_total: total,
-          verdict,
-          scores: Object.fromEntries(parts.map(p => [p.name, p.score])),
-          why: parts.flatMap(p => p.reasons)
-        });
+    // Analyze Tier A first if we have candidates
+    let analyzed = [];
+    if (candidates.length > 0) {
+      analyzed = await analyzeAndScore(candidates, limit);
+    }
+
+    // If CSE failed OR no credible results, run FALLBACKS
+    if (source_tier === "FALLBACK" || analyzed.length === 0) {
+      const fb = await tierBSearch(query);            // Crossref + OpenAlex + Wikipedia refs
+      const analyzedFB = await analyzeAndScore(fb, limit);
+      if (analyzedFB.length > 0) {
+        source_tier = "Crossref/OpenAlex/Wikipedia";
+        analyzed = analyzedFB;
       }
-      if (analyzed.length >= limit) break;
     }
 
     res.writeHead(200, CORS_HEADERS).end(JSON.stringify({
       query,
-      source_tier: "CSE",
+      source_tier,
       results: analyzed
     }));
   } catch (err) {
@@ -67,11 +59,15 @@ export default async function handler(req, res) {
   }
 }
 
-// ===== Helpers =====
+/* =========================
+   External Search Providers
+   ========================= */
+
+// TIER A — Google CSE (100 free queries/day)
 async function cseSearch(query) {
-  const key = process.env.CSE_KEY;  // set in Vercel dashboard
-  const cx  = process.env.CSE_CX;   // set in Vercel dashboard
-  if (!key || !cx) throw new Error("Missing CSE_KEY or CSE_CX env vars");
+  const key = process.env.CSE_KEY;
+  const cx  = process.env.CSE_CX;
+  if (!key || !cx) throw new Error("Missing CSE_KEY or CSE_CX");
 
   const u = new URL("https://www.googleapis.com/customsearch/v1");
   u.searchParams.set("key", key);
@@ -86,6 +82,88 @@ async function cseSearch(query) {
   const items = j.items || [];
   return items.map(i => ({ title: i.title, url: i.link }));
 }
+
+// TIER B — Free fallbacks (no keys required)
+async function tierBSearch(query) {
+  const map = new Map(); // url -> { title, url }
+
+  await addCrossref(query, map);
+  await addOpenAlex(query, map);
+  await addWikipediaRefs(query, map);
+
+  return [...map.values()];
+}
+
+async function addCrossref(q, out) {
+  try {
+    const u = new URL("https://api.crossref.org/works");
+    u.searchParams.set("query", q);
+    u.searchParams.set("rows", "15");
+    const j = await (await fetch(u)).json();
+    const items = j.message?.items || [];
+    for (const it of items) {
+      const doi = it.DOI;
+      const url = it.URL || (doi ? `https://doi.org/${doi}` : null);
+      if (!url) continue;
+      const title = (it.title && it.title[0]) ? it.title[0] : url;
+      out.set(url, { title, url });
+    }
+  } catch {}
+}
+
+async function addOpenAlex(q, out) {
+  try {
+    const u = new URL("https://api.openalex.org/works");
+    u.searchParams.set("search", q);
+    u.searchParams.set("per_page", "15");
+    const j = await (await fetch(u)).json();
+    const items = j.results || [];
+    for (const it of items) {
+      const url =
+        it.primary_location?.source?.hosted_document?.url ||
+        it.primary_location?.landing_page_url ||
+        (it.doi ? `https://doi.org/${it.doi}` : null);
+      if (!url) continue;
+      out.set(url, { title: it.title || url, url });
+    }
+  } catch {}
+}
+
+async function addWikipediaRefs(q, out) {
+  try {
+    // 1) Search Wikipedia for the topic
+    const s = new URL("https://en.wikipedia.org/w/api.php");
+    s.searchParams.set("action", "query");
+    s.searchParams.set("list", "search");
+    s.searchParams.set("format", "json");
+    s.searchParams.set("srsearch", q);
+    s.searchParams.set("origin", "*"); // allow CORS
+    const sj = await (await fetch(s)).json();
+    const pageId = sj.query?.search?.[0]?.pageid;
+    if (!pageId) return;
+
+    // 2) Get external links (references) from the article
+    const p = new URL("https://en.wikipedia.org/w/api.php");
+    p.searchParams.set("action", "parse");
+    p.searchParams.set("pageid", String(pageId));
+    p.searchParams.set("prop", "externallinks");
+    p.searchParams.set("format", "json");
+    p.searchParams.set("origin", "*");
+    const pj = await (await fetch(p)).json();
+    const links = pj.parse?.externallinks || [];
+
+    // 3) Keep only DOI/gov/edu/major org/publishers
+    for (const L of links) {
+      if (/doi\.org|\.gov(\.|\/)|\.edu(\.|\/)|who\.int|un\.org|worldbank\.org|unesco\.org|unicef\.org|nih\.gov|oecd\.org|imf\.org/i.test(L)) {
+        out.set(L, { title: L, url: L });
+      }
+    }
+  } catch {}
+}
+
+/* =========================
+   Analyze & Score Pages
+   ========================= */
 
 function hostOf(u) { try { return new URL(u).hostname; } catch { return ""; } }
 function pick(re, s, group = 1) { const m = s.match(re); return m ? (m[group] || "").trim() : ""; }
@@ -104,10 +182,9 @@ async function getPageMeta(u) {
   }
 }
 
-// ---- 6 Criteria, deterministic and explainable ----
 function score(name, score, reasons) { return { name, score, reasons }; }
 
-function scorePurpose(meta, url) {
+function scorePurpose(meta) {
   const reasons = [];
   const info = /research|report|method|policy|about/i.test(meta.html);
   const ads  = /advert|sponsored/i.test(meta.html);
@@ -127,7 +204,7 @@ function scoreAuthority(meta, url) {
   reasons.push("Publisher/author unclear");
   return score("Authority", 1, reasons);
 }
-function scoreAudience(meta) {
+function scoreAudience() {
   return score("Audience", 3, ["General audience language acceptable"]);
 }
 function scoreObjectivity(meta) {
@@ -153,3 +230,48 @@ function scoreCurrency(meta) {
   }
   return score("Currency", 1, ["No clear date found"]);
 }
+
+async function analyzeAndScore(candidates, max) {
+  // Dedup + cap fetch cost
+  const unique = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const u = c.url;
+    if (!u || seen.has(u)) continue;
+    seen.add(u);
+    unique.push(c);
+    if (unique.length >= 20) break; // cap
+  }
+
+  const results = [];
+  for (const c of unique) {
+    const meta = await getPageMeta(c.url);
+    const parts = [
+      scorePurpose(meta, c.url),
+      scoreAuthority(meta, c.url),
+      scoreAudience(meta, c.url),
+      scoreObjectivity(meta, c.url),
+      scoreAccuracy(meta, c.url),
+      scoreCurrency(meta, c.url)
+    ];
+    const total = parts.reduce((s, p) => s + p.score, 0);
+    const verdict = total >= 25 ? "CREDIBLE" : total >= 20 ? "LIMITED" : "NOT_CREDIBLE";
+    if (verdict === "CREDIBLE") {
+      results.push({
+        title: meta.title || c.title || c.url,
+        url: c.url,
+        publisher: meta.publisher || hostOf(c.url),
+        published: meta.published || null,
+        score_total: total,
+        verdict,
+        scores: Object.fromEntries(parts.map(p => [p.name, p.score])),
+        why: parts.flatMap(p => p.reasons)
+      });
+      if (results.length >= max) break;
+    }
+  }
+  // Sort by score desc
+  results.sort((a, b) => b.score_total - a.score_total);
+  return results;
+}
+
